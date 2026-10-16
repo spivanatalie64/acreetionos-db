@@ -99,12 +99,19 @@ CREATE TABLE IF NOT EXISTS providers (
     vetting_flags       TEXT NOT NULL DEFAULT '[]',
     personal_email      INTEGER NOT NULL DEFAULT 0,
     last_seen           TEXT,
-    expiry_warning_sent INTEGER NOT NULL DEFAULT 0
+    expiry_warning_sent INTEGER NOT NULL DEFAULT 0,
+    confirm_token       TEXT,
+    email_confirmed_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS providers_status_idx  ON providers (status);
 CREATE INDEX IF NOT EXISTS providers_created_idx ON providers (created DESC);
 CREATE INDEX IF NOT EXISTS providers_removal_idx ON providers (removal_requested)
     WHERE removal_requested = 1;
+-- NOTE: providers_token_idx (unique on confirm_token) is created in
+-- ensure_columns(), AFTER the column exists. Putting it here killed the old
+-- database on startup — CREATE TABLE IF NOT EXISTS does not reconcile an
+-- existing table's columns, so the index referenced a column that does not
+-- exist yet in a pre-7k8 database.
 
 CREATE TABLE IF NOT EXISTS subscribers (
     list              TEXT NOT NULL CHECK (list IN ('hosting','newsletter')),
@@ -168,6 +175,26 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 CREATE INDEX IF NOT EXISTS kv_expiry_idx ON kv (expires_at);
 """
+
+
+def ensure_columns():
+    """Carry old tables to the current shape without a migration framework.
+
+    The ALTERs here mirror the CREATE TABLE above; keep them in sync when new
+    columns land. Each runs only when the column is absent, so restarts are
+    idempotent.
+    """
+    cols = {r["name"] for r in db().execute("PRAGMA table_info(providers)").fetchall()}
+    if "confirm_token" not in cols:
+        db().execute("ALTER TABLE providers ADD COLUMN confirm_token TEXT")
+    if "email_confirmed_at" not in cols:
+        db().execute("ALTER TABLE providers ADD COLUMN email_confirmed_at TEXT")
+    # Unique index follows the columns (see SCHEMA note): partial-unique so a
+    # NULL confirm_token never collides, which is most of the table forever.
+    db().execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS providers_token_idx "
+        "ON providers (confirm_token) WHERE confirm_token IS NOT NULL"
+    )
 
 
 def now_ms():
@@ -287,6 +314,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in url.path.split("/") if p]
 
         if parts[:1] == ["providers"]:
+            if len(parts) == 3 and parts[1] == "by-token":
+                return self.guarded(self.provider_by_token, unquote(parts[2]))
             if len(parts) == 1:
                 return self.guarded(self.list_providers, q)
             return self.guarded(self.get_provider, unquote(parts[1]))
@@ -347,6 +376,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(413, "body too large")
         if parts[:2] == ["subscribers", "confirm"]:
             return self.guarded(self.confirm_subscriber, payload)
+        if parts[:2] == ["providers", "confirm"]:
+            return self.guarded(self.confirm_provider, payload)
         if parts[:2] == ["limits", "check"]:
             return self.guarded(self.limits_check, payload, allow_over=False)
         if parts[:2] == ["limits", "add"]:
@@ -418,8 +449,9 @@ class Handler(BaseHTTPRequestHandler):
             """INSERT INTO providers (id, org, email, website, mirror_url, location,
                  bandwidth, notes, password, status, created, removal_requested,
                  removal_reason, discord_user_id, subscribed, vetting_score,
-                 vetting_flags, personal_email, last_seen, expiry_warning_sent)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 vetting_flags, personal_email, last_seen, expiry_warning_sent,
+                 confirm_token, email_confirmed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  org=excluded.org, email=excluded.email, website=excluded.website,
                  mirror_url=excluded.mirror_url, location=excluded.location,
@@ -430,7 +462,9 @@ class Handler(BaseHTTPRequestHandler):
                  subscribed=excluded.subscribed, vetting_score=excluded.vetting_score,
                  vetting_flags=excluded.vetting_flags,
                  personal_email=excluded.personal_email, last_seen=excluded.last_seen,
-                 expiry_warning_sent=excluded.expiry_warning_sent""",
+                 expiry_warning_sent=excluded.expiry_warning_sent,
+                 confirm_token=excluded.confirm_token,
+                 email_confirmed_at=excluded.email_confirmed_at""",
             (
                 p["id"], p["org"], p["email"], p.get("website", ""),
                 p.get("mirror_url"), p.get("location"), p.get("bandwidth", ""),
@@ -441,9 +475,39 @@ class Handler(BaseHTTPRequestHandler):
                 json.dumps(p.get("vetting_flags") or []),
                 int(bool(p.get("personal_email"))), p.get("last_seen"),
                 int(bool(p.get("expiry_warning_sent"))),
+                p.get("confirm_token"), p.get("email_confirmed_at"),
             ),
         )
         return self.send(200, {"ok": True, "id": p["id"]})
+
+    def provider_by_token(self, token):
+        row = db().execute(
+            "SELECT * FROM providers WHERE confirm_token = ?", (token,)
+        ).fetchone()
+        if not row:
+            return self.fail(404, "not found")
+        return self.send(200, dict(row))
+
+    def confirm_provider(self, s):
+        """One-shot email confirmation for a mirror registration (bead 7k8).
+
+        Single use: after this runs the token is consumed, so replaying the
+        link cannot flip an admin-approved provider's state again."""
+        token = s.get("confirm_token")
+        if not token:
+            return self.fail(400, "confirm_token required")
+        cur = db().execute(
+            """UPDATE providers SET email_confirmed_at = datetime('now'),
+                  confirm_token = NULL
+               WHERE confirm_token = ? AND email_confirmed_at IS NULL""",
+            (token,),
+        )
+        if cur.rowcount == 0:
+            return self.fail(404, "unknown token or already confirmed")
+        row = db().execute(
+            "SELECT * FROM providers WHERE email_confirmed_at = datetime('now')"
+        ).fetchone()
+        return self.send(200, {"ok": True, "provider": dict(row) if row else None})
 
     def list_subscribers(self, q):
         lst = (q.get("list") or [None])[0]
@@ -698,6 +762,7 @@ def main():
         pass
     conn = db()
     conn.executescript(SCHEMA)
+    ensure_columns()
     token = load_token()
     # The sweeper does the deletes that nobody else in the request path would
     # think to do: dead rate windows, stale replay keys, abandoned mail jobs.
