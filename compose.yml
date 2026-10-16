@@ -1,0 +1,61 @@
+name: acreetionos-db
+
+# Stateful records (ISO providers, subscriber lists) as a SQLite file behind a
+# tiny stdlib HTTP shim. Replaces the Postgres container.
+#
+# Why SQLite rather than Postgres: SQLite has no network protocol, so the
+# database cannot be connected to by anything. It is a file. Only the process in
+# this container can read it. For a project holding provider passwords and
+# subscriber addresses, that removes the whole category of "database credential
+# leaked" and "database port exposed" — which matters more than the RAM saving.
+#
+# Why a shim at all: a Cloudflare Worker cannot open a file, so something has to
+# serve it over loopback. That is the entire job of db-api.py.
+#
+# Memory is capped at 128 MiB by cgroup. Measured resident is well under that;
+# SQLite is a library inside one Python process, not a separate database server.
+#
+# The database file lives on the host's disk (/opt/acreetionos-db/data), which is
+# 362 GB free. WAL mode means reads do not block the writer.
+
+services:
+  db:
+    image: python:3.12-alpine
+    restart: always
+    container_name: acreetionos-db
+    command: ["python", "/app/db-api.py"]
+    working_dir: /app
+    environment:
+      DB_PATH: /data/acreetionos.db
+      TOKEN_PATH: /run/secrets/api_token
+      # Loopback only. nginx in front of this is the sole way in.
+      LISTEN_HOST: "0.0.0.0"
+      LISTEN_PORT: "8284"
+    secrets:
+      - api_token
+    ports:
+      - "127.0.0.1:8284:8284"
+    networks:
+      - acreetionos-db-net
+    volumes:
+      - ./db-api.py:/app/db-api.py:ro
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8284/health',timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          # The constraint: 128 MiB, enforced by cgroup, not by hope.
+          memory: 128M
+
+secrets:
+  api_token:
+    file: ./secrets/api_token
+
+networks:
+  acreetionos-db-net:
